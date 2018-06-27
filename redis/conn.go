@@ -27,10 +27,13 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/yossigo/eredis/eredis"
 )
 
 var (
-	_ ConnWithTimeout = (*conn)(nil)
+	_  ConnWithTimeout = (*conn)(nil)
+	ec *eredis.Client  // Single eredis client for all "connections"
 )
 
 // conn is the low-level implementation of Conn
@@ -55,6 +58,12 @@ type conn struct {
 
 	// Scratch space for formatting integers and floats.
 	numScratch [40]byte
+
+	// eredis
+	isEmbedded bool          // Embedded connection flag
+	ebr        *bytes.Buffer // Read (reply) buffer
+	ebw        [][]string    // Write "buffer"
+	ewarg      int           // Write buffer argument index
 }
 
 // DialTimeout acts like Dial but takes timeouts for establishing the
@@ -180,54 +189,70 @@ func Dial(network, address string, options ...DialOption) (Conn, error) {
 		do.dial = do.dialer.Dial
 	}
 
-	netConn, err := do.dial(network, address)
-	if err != nil {
-		return nil, err
-	}
-
-	if do.useTLS {
-		var tlsConfig *tls.Config
-		if do.tlsConfig == nil {
-			tlsConfig = &tls.Config{InsecureSkipVerify: do.skipVerify}
-		} else {
-			tlsConfig = cloneTLSConfig(do.tlsConfig)
+	var c *conn
+	if network == "eredis" {
+		err := ecNewConnection()
+		if err != nil {
+			return nil, err
 		}
-		if tlsConfig.ServerName == "" {
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
+
+		ecbr := bytes.NewBuffer([]byte{})
+		c = &conn{
+			isEmbedded:  true,
+			ebr:         ecbr,
+			br:          bufio.NewReader(ecbr),
+			readTimeout: do.readTimeout,
+		}
+	} else {
+		netConn, err := do.dial(network, address)
+		if err != nil {
+			return nil, err
+		}
+
+		if do.useTLS {
+			var tlsConfig *tls.Config
+			if do.tlsConfig == nil {
+				tlsConfig = &tls.Config{InsecureSkipVerify: do.skipVerify}
+			} else {
+				tlsConfig = cloneTLSConfig(do.tlsConfig)
+			}
+			if tlsConfig.ServerName == "" {
+				host, _, err := net.SplitHostPort(address)
+				if err != nil {
+					netConn.Close()
+					return nil, err
+				}
+				tlsConfig.ServerName = host
+			}
+
+			tlsConn := tls.Client(netConn, tlsConfig)
+			if err := tlsConn.Handshake(); err != nil {
 				netConn.Close()
 				return nil, err
 			}
-			tlsConfig.ServerName = host
+			netConn = tlsConn
 		}
 
-		tlsConn := tls.Client(netConn, tlsConfig)
-		if err := tlsConn.Handshake(); err != nil {
-			netConn.Close()
-			return nil, err
+		c = &conn{
+			conn:         netConn,
+			bw:           bufio.NewWriter(netConn),
+			br:           bufio.NewReader(netConn),
+			readTimeout:  do.readTimeout,
+			writeTimeout: do.writeTimeout,
 		}
-		netConn = tlsConn
-	}
 
-	c := &conn{
-		conn:         netConn,
-		bw:           bufio.NewWriter(netConn),
-		br:           bufio.NewReader(netConn),
-		readTimeout:  do.readTimeout,
-		writeTimeout: do.writeTimeout,
-	}
-
-	if do.password != "" {
-		if _, err := c.Do("AUTH", do.password); err != nil {
-			netConn.Close()
-			return nil, err
+		if do.password != "" {
+			if _, err := c.Do("AUTH", do.password); err != nil {
+				netConn.Close()
+				return nil, err
+			}
 		}
-	}
 
-	if do.db != 0 {
-		if _, err := c.Do("SELECT", do.db); err != nil {
-			netConn.Close()
-			return nil, err
+		if do.db != 0 {
+			if _, err := c.Do("SELECT", do.db); err != nil {
+				netConn.Close()
+				return nil, err
+			}
 		}
 	}
 
@@ -306,7 +331,9 @@ func (c *conn) Close() error {
 	err := c.err
 	if c.err == nil {
 		c.err = errors.New("redigo: closed")
-		err = c.conn.Close()
+		if !c.isEmbedded {
+			err = c.conn.Close()
+		}
 	}
 	c.mu.Unlock()
 	return err
@@ -318,7 +345,9 @@ func (c *conn) fatal(err error) error {
 		c.err = err
 		// Close connection to force errors on subsequent calls and to unblock
 		// other reader or writer.
-		c.conn.Close()
+		if !c.isEmbedded {
+			c.conn.Close()
+		}
 	}
 	c.mu.Unlock()
 	return err
@@ -371,14 +400,18 @@ func (c *conn) writeFloat64(n float64) error {
 }
 
 func (c *conn) writeCommand(cmd string, args []interface{}) error {
-	c.writeLen('*', 1+len(args))
-	if err := c.writeString(cmd); err != nil {
-		return err
-	}
-	for _, arg := range args {
-		if err := c.writeArg(arg, true); err != nil {
+	if !c.isEmbedded {
+		c.writeLen('*', 1+len(args))
+		if err := c.writeString(cmd); err != nil {
 			return err
 		}
+		for _, arg := range args {
+			if err := c.writeArg(arg, true); err != nil {
+				return err
+			}
+		}
+	} else {
+		return c.ecWriteCommand(cmd, args)
 	}
 	return nil
 }
@@ -561,9 +594,10 @@ func (c *conn) Send(cmd string, args ...interface{}) error {
 	c.mu.Lock()
 	c.pending += 1
 	c.mu.Unlock()
-	if c.writeTimeout != 0 {
+	if c.writeTimeout != 0 && !c.isEmbedded {
 		c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
+
 	if err := c.writeCommand(cmd, args); err != nil {
 		return c.fatal(err)
 	}
@@ -571,11 +605,17 @@ func (c *conn) Send(cmd string, args ...interface{}) error {
 }
 
 func (c *conn) Flush() error {
-	if c.writeTimeout != 0 {
-		c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-	}
-	if err := c.bw.Flush(); err != nil {
-		return c.fatal(err)
+	if !c.isEmbedded {
+		if c.writeTimeout != 0 {
+			c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+		}
+		if err := c.bw.Flush(); err != nil {
+			return c.fatal(err)
+		}
+	} else {
+		if err := c.ecFlush(); err != nil {
+			return c.fatal(err)
+		}
 	}
 	return nil
 }
@@ -626,7 +666,7 @@ func (c *conn) DoWithTimeout(readTimeout time.Duration, cmd string, args ...inte
 		return nil, nil
 	}
 
-	if c.writeTimeout != 0 {
+	if c.writeTimeout != 0 && !c.isEmbedded {
 		c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
 
@@ -636,15 +676,21 @@ func (c *conn) DoWithTimeout(readTimeout time.Duration, cmd string, args ...inte
 		}
 	}
 
-	if err := c.bw.Flush(); err != nil {
-		return nil, c.fatal(err)
-	}
+	if !c.isEmbedded {
+		if err := c.bw.Flush(); err != nil {
+			return nil, c.fatal(err)
+		}
 
-	var deadline time.Time
-	if readTimeout != 0 {
-		deadline = time.Now().Add(readTimeout)
+		var deadline time.Time
+		if readTimeout != 0 {
+			deadline = time.Now().Add(readTimeout)
+		}
+		c.conn.SetReadDeadline(deadline)
+	} else {
+		if err := c.ecFlush(); err != nil {
+			return nil, c.fatal(err)
+		}
 	}
-	c.conn.SetReadDeadline(deadline)
 
 	if cmd == "" {
 		reply := make([]interface{}, pending)
@@ -670,4 +716,103 @@ func (c *conn) DoWithTimeout(readTimeout time.Duration, cmd string, args ...inte
 		}
 	}
 	return reply, err
+}
+
+func ecNewConnection() (err error) {
+	// fmt.Print("ecNewConnection: start .. ")
+	if ec == nil {
+		// fmt.Print("init .. ")
+		err = eredis.Init()
+		if err != nil {
+			return fmt.Errorf("ecNewConnection: could not initialize the eredis library (%s)", err.Error())
+		}
+		ec = eredis.CreateClient()
+	}
+	// fmt.Print("end\n")
+	return nil
+}
+
+func (c *conn) ecWriteCommand(cmd string, args []interface{}) (err error) {
+	w := make([]string, len(args)+1)
+	w[0] = cmd
+	c.ebw = append(c.ebw, w)
+	c.ewarg = 1
+	for _, arg := range args {
+		err = c.ecWriteArg(arg, true)
+		if err != nil {
+			return err
+		}
+	}
+	// fmt.Printf("ecWriteCommand: (%d) %v\n", len(w), w)
+	return nil
+}
+
+func (c *conn) ecWriteArg(arg interface{}, argumentTypeOK bool) (err error) {
+	switch arg := arg.(type) {
+	case string:
+		return c.ecWriteString(arg)
+	case []byte:
+		return c.ecWriteBytes(arg)
+	case int:
+		return c.ecWriteBytes(strconv.AppendInt(c.numScratch[:0], int64(arg), 10))
+	case int64:
+		return c.ecWriteBytes(strconv.AppendInt(c.numScratch[:0], arg, 10))
+	case float64:
+		return c.ecWriteBytes(strconv.AppendFloat(c.numScratch[:0], arg, 'g', -1, 64))
+	case bool:
+		if arg {
+			return c.writeString("1")
+		} else {
+			return c.writeString("0")
+		}
+	case nil:
+		return c.writeString("")
+	case Argument:
+		if argumentTypeOK {
+			return c.ecWriteArg(arg.RedisArg(), false)
+		}
+		// See comment in default clause below.
+		var buf bytes.Buffer
+		fmt.Fprint(&buf, arg)
+		return c.ecWriteBytes(buf.Bytes())
+	default:
+		// This default clause is intended to handle builtin numeric types.
+		// The function should return an error for other types, but this is not
+		// done for compatibility with previous versions of the package.
+		var buf bytes.Buffer
+		fmt.Fprint(&buf, arg)
+		return c.ecWriteBytes(buf.Bytes())
+	}
+}
+
+func (c *conn) ecWriteString(s string) (err error) {
+	c.ebw[len(c.ebw)-1][c.ewarg] = s
+	c.ewarg++
+	return nil
+}
+
+func (c *conn) ecWriteBytes(p []byte) (err error) {
+	return c.ecWriteString(string(p[:]))
+}
+
+func (c *conn) ecFlush() (err error) {
+	c.ebr.Reset()
+	for _, cmd := range c.ebw {
+		// fmt.Printf("ecFlush: cmd = %v\n", cmd)
+		ec.PrepareRequest(cmd)
+		err = ec.Execute()
+		if err != nil {
+			fmt.Printf("ecFlush: error = %v\n", err)
+			return err
+		}
+		for {
+			chunk := ec.ReadReplyChunk()
+			if chunk == nil {
+				break
+			}
+			c.ebr.WriteString(*chunk)
+		}
+	}
+	c.ebw = [][]string{} // TODO: avoid realloc
+	return nil
 }
