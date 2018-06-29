@@ -130,3 +130,31 @@ func TestEredigoTransaction(t *testing.T) {
 	assertEqual(t, rep[1], "OK")
 	assertEqual(t, rep[2], "bar")
 }
+
+func TestEredigoScript(t *testing.T) {
+	c, err := redis.Dial("eredis", "")
+	if err != nil {
+		t.Errorf("Could not dial: %s", err.Error())
+		t.Fail()
+	}
+	defer c.Close()
+
+	s := redis.NewScript(0, `
+		local rep = {}
+		for _, v in ipairs(ARGV) do
+			table.insert(rep, 1, v)
+		end
+		return rep
+		`)
+
+	rep, err := redis.Strings(s.Do(c, "foo", "bar"))
+	if err != nil {
+		t.Errorf("Could not EVAL: %s", err.Error())
+		t.Fail()
+	}
+
+	assertEqual(t, len(rep), 2)
+	assertEqual(t, rep[0], "bar")
+	assertEqual(t, rep[1], "foo")
+
+}

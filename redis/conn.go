@@ -28,7 +28,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yossigo/eredis/eredis"
+	"github.com/redislabs/eredis/eredis"
 )
 
 var (
@@ -719,16 +719,13 @@ func (c *conn) DoWithTimeout(readTimeout time.Duration, cmd string, args ...inte
 }
 
 func ecNewConnection() (err error) {
-	// fmt.Print("ecNewConnection: start .. ")
 	if ec == nil {
-		// fmt.Print("init .. ")
 		err = eredis.Init()
 		if err != nil {
 			return fmt.Errorf("ecNewConnection: could not initialize the eredis library (%s)", err.Error())
 		}
 		ec = eredis.CreateClient()
 	}
-	// fmt.Print("end\n")
 	return nil
 }
 
@@ -743,7 +740,6 @@ func (c *conn) ecWriteCommand(cmd string, args []interface{}) (err error) {
 			return err
 		}
 	}
-	// fmt.Printf("ecWriteCommand: (%d) %v\n", len(w), w)
 	return nil
 }
 
@@ -798,14 +794,13 @@ func (c *conn) ecWriteBytes(p []byte) (err error) {
 func (c *conn) ecFlush() (err error) {
 	c.ebr.Reset()
 	for _, cmd := range c.ebw {
-		// fmt.Printf("ecFlush: cmd = %v\n", cmd)
 		ec.PrepareRequest(cmd)
 		err = ec.Execute()
 		if err != nil {
-			fmt.Printf("ecFlush: error = %v\n", err)
 			return err
 		}
 		for {
+			// TODO: make a proper chunkBuffer
 			chunk := ec.ReadReplyChunk()
 			if chunk == nil {
 				break
