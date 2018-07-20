@@ -28,7 +28,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/redislabs/eredis/eredis"
+	"github.com/redislabs/eredis/golang/eredis"
 )
 
 var (
@@ -62,8 +62,6 @@ type conn struct {
 	// eredis
 	isEmbedded bool          // Embedded connection flag
 	ebr        *bytes.Buffer // Read (reply) buffer
-	ebw        [][]string    // Write "buffer"
-	ewarg      int           // Write buffer argument index
 }
 
 // DialTimeout acts like Dial but takes timeouts for establishing the
@@ -612,10 +610,6 @@ func (c *conn) Flush() error {
 		if err := c.bw.Flush(); err != nil {
 			return c.fatal(err)
 		}
-	} else {
-		if err := c.ecFlush(); err != nil {
-			return c.fatal(err)
-		}
 	}
 	return nil
 }
@@ -686,10 +680,6 @@ func (c *conn) DoWithTimeout(readTimeout time.Duration, cmd string, args ...inte
 			deadline = time.Now().Add(readTimeout)
 		}
 		c.conn.SetReadDeadline(deadline)
-	} else {
-		if err := c.ecFlush(); err != nil {
-			return nil, c.fatal(err)
-		}
 	}
 
 	if cmd == "" {
@@ -732,21 +722,34 @@ func ecNewConnection() (err error) {
 func (c *conn) ecWriteCommand(cmd string, args []interface{}) (err error) {
 	w := make([]string, len(args)+1)
 	w[0] = cmd
-	c.ebw = append(c.ebw, w)
-	c.ewarg = 1
-	for _, arg := range args {
-		err = c.ecWriteArg(arg, true)
+	for i, arg := range args {
+		w[i+1], err = c.ecWriteArg(arg, true)
 		if err != nil {
 			return err
 		}
 	}
+
+	ec.PrepareRequest(w)
+	err = ec.Execute()
+	if err != nil {
+		return err
+	}
+
+	for {
+		chunk := ec.ReadReplyChunk()
+		if chunk == nil {
+			break
+		}
+		c.ebr.WriteString(*chunk)
+	}
+
 	return nil
 }
 
-func (c *conn) ecWriteArg(arg interface{}, argumentTypeOK bool) (err error) {
+func (c *conn) ecWriteArg(arg interface{}, argumentTypeOK bool) (str string, err error) {
 	switch arg := arg.(type) {
 	case string:
-		return c.ecWriteString(arg)
+		return arg, nil
 	case []byte:
 		return c.ecWriteBytes(arg)
 	case int:
@@ -757,12 +760,12 @@ func (c *conn) ecWriteArg(arg interface{}, argumentTypeOK bool) (err error) {
 		return c.ecWriteBytes(strconv.AppendFloat(c.numScratch[:0], arg, 'g', -1, 64))
 	case bool:
 		if arg {
-			return c.writeString("1")
+			return "1", nil
 		} else {
-			return c.writeString("0")
+			return "0", nil
 		}
 	case nil:
-		return c.writeString("")
+		return "", nil
 	case Argument:
 		if argumentTypeOK {
 			return c.ecWriteArg(arg.RedisArg(), false)
@@ -781,33 +784,6 @@ func (c *conn) ecWriteArg(arg interface{}, argumentTypeOK bool) (err error) {
 	}
 }
 
-func (c *conn) ecWriteString(s string) (err error) {
-	c.ebw[len(c.ebw)-1][c.ewarg] = s
-	c.ewarg++
-	return nil
-}
-
-func (c *conn) ecWriteBytes(p []byte) (err error) {
-	return c.ecWriteString(string(p[:]))
-}
-
-func (c *conn) ecFlush() (err error) {
-	c.ebr.Reset()
-	for _, cmd := range c.ebw {
-		ec.PrepareRequest(cmd)
-		err = ec.Execute()
-		if err != nil {
-			return err
-		}
-		for {
-			// TODO: make a proper chunkBuffer
-			chunk := ec.ReadReplyChunk()
-			if chunk == nil {
-				break
-			}
-			c.ebr.WriteString(*chunk)
-		}
-	}
-	c.ebw = [][]string{} // TODO: avoid realloc
-	return nil
+func (c *conn) ecWriteBytes(p []byte) (str string, err error) {
+	return string(p[:]), nil
 }
